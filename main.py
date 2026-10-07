@@ -10,6 +10,7 @@ import urllib.parse
 import io
 import tempfile
 import random
+import html
 from datetime import datetime
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,20 @@ USER_AGENTS = [
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+# حداکثر طول متن پاسخ سرور که برای کاربر نمایش داده می‌شود (برای جلوگیری از پیام‌های بیش از حد طولانی)
+MAX_RESPONSE_PREVIEW = 1500
+
+def format_server_response(response) -> str:
+    """پاسخ خام سرور (کد وضعیت + بدنه) را برای نمایش امن در تلگرام فرمت می‌کند."""
+    try:
+        body = response.text
+    except Exception:
+        body = ""
+    if len(body) > MAX_RESPONSE_PREVIEW:
+        body = body[:MAX_RESPONSE_PREVIEW] + "\n... (کوتاه‌شده)"
+    body_safe = html.escape(body) if body else "(بدون محتوا)"
+    return f"📡 <b>کد وضعیت:</b> <code>{response.status_code}</code>\n📄 <b>پاسخ سرور:</b>\n<pre>{body_safe}</pre>"
 
 # ==========================================
 # سیستم امنیتی و سهمیه ثابت (مادام‌العمر) کاربران
@@ -836,12 +851,13 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await msg.edit_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
             return OTP
         else:
-            await msg.edit_text(f"❌ خطا از سمت سیستم اکالا: <code>{response.status_code}</code>", parse_mode='HTML')
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+            await msg.edit_text(f"❌ <b>خطا از سمت سیستم اکالا:</b>\n\n{format_server_response(response)}", reply_markup=kb, parse_mode='HTML')
             return ConversationHandler.END
             
     except Exception as e:
         logging.error(f"Error in OTP request: {e}")
-        await msg.edit_text("❌ خطا در ارتباط با سرور (احتمالاً پروکسی قطع است یا IP مسدود شده).\nلطفاً دوباره تلاش کنید.")
+        await msg.edit_text(f"❌ خطا در ارتباط با سرور (احتمالاً پروکسی قطع است یا IP مسدود شده).\n\n<b>جزئیات خطا:</b>\n<code>{html.escape(str(e))}</code>", parse_mode='HTML')
         return ConversationHandler.END
 
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -874,9 +890,9 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await redis_client.setex(f"otp_cooldown:{phone}", 120, "1")
             await query.edit_message_text(f"✉️ <b>کد تایید مجدداً ارسال شد.</b>\nکد را وارد کنید:", reply_markup=kb, parse_mode='HTML')
         else:
-            await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
+            await query.edit_message_text(f"❌ <b>خطا در ارسال مجدد:</b>\n\n{format_server_response(response)}", reply_markup=kb, parse_mode='HTML')
     except Exception as e:
-        await query.edit_message_text("❌ خطا در ارتباط با سرور هنگام ارسال مجدد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل", callback_data="cancel_action")]]))
+        await query.edit_message_text(f"❌ خطا در ارتباط با سرور هنگام ارسال مجدد.\n\n<b>جزئیات خطا:</b>\n<code>{html.escape(str(e))}</code>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل", callback_data="cancel_action")]]), parse_mode='HTML')
         
     return OTP 
 
@@ -911,13 +927,13 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
                 return await generate_and_send_link(update, context, msg)
         else:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-            await msg.edit_text("❌ کد وارد شده اشتباه یا منقضی است.\nمجدداً تلاش کنید.", reply_markup=kb)
+            await msg.edit_text(f"❌ <b>کد وارد شده اشتباه یا منقضی است.</b>\n\n{format_server_response(response)}", reply_markup=kb, parse_mode='HTML')
             return OTP 
             
     except Exception as e:
         logging.error(f"Error verifying OTP: {e}")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل", callback_data="cancel_action")]])
-        await msg.edit_text("❌ خطا در ارتباط با سرور. لطفاً مجدد تلاش کنید.", reply_markup=kb)
+        await msg.edit_text(f"❌ خطا در ارتباط با سرور. لطفاً مجدد تلاش کنید.\n\n<b>جزئیات خطا:</b>\n<code>{html.escape(str(e))}</code>", reply_markup=kb, parse_mode='HTML')
         return OTP
 
 async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1031,3 +1047,4 @@ async def main():
 if __name__ == '__main__':
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
+
