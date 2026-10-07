@@ -808,6 +808,12 @@ async def start_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.callback_query.answer(msg, show_alert=True)
         return ConversationHandler.END
 
+    # برای هر لینک‌سازی جدید device_id و session_id تازه ساخته می‌شود؛ در غیر این صورت سرور اکالا
+    # درخواست OTP برای شماره دوم را از همان "دستگاه" قبلی می‌بیند و ممکن است پاسخ 200 بدهد
+    # بدون این‌که واقعاً پیامک را ارسال کند.
+    context.user_data.pop('device_id', None)
+    context.user_data.pop('session_id', None)
+
     await update.callback_query.answer()
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
     await update.callback_query.edit_message_text("📱 <b>لطفاً شماره موبایل خود را وارد کنید:</b>", reply_markup=kb, parse_mode='HTML')
@@ -821,15 +827,6 @@ async def cancel_process_callback(update: Update, context: ContextTypes.DEFAULT_
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     phone = update.message.text.strip()
-    
-    # سیستم محدودیت زمانی پیامک (Cooldown)
-    ttl = await redis_client.ttl(f"otp_cooldown:{phone}")
-    if ttl > 0:
-        minutes, seconds = divmod(ttl, 60)
-        time_str = f"{minutes} دقیقه و {seconds} ثانیه" if minutes > 0 else f"{seconds} ثانیه"
-        await update.message.reply_text(f"⏳ پیامک به تازگی برای این شماره ارسال شده است.\nلطفاً {time_str} صبر کنید و سپس دوباره تلاش کنید.", parse_mode='HTML')
-        return PHONE
-        
     context.user_data['phone'] = phone
     msg = await update.message.reply_text("⏳ در حال ارتباط با سرور و ارسال پیامک...")
     
@@ -845,8 +842,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         )
         
         if response.status_code == 200:
-            # اعمال محدودیت زمانی 2 دقیقه ای برای شماره
-            await redis_client.setex(f"otp_cooldown:{phone}", 120, "1") 
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
             await msg.edit_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", reply_markup=kb, parse_mode='HTML')
             return OTP
@@ -863,14 +858,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     phone = context.user_data.get('phone')
-    
-    # چک کردن محدودیت زمانی قبل از ارسال مجدد
-    ttl = await redis_client.ttl(f"otp_cooldown:{phone}")
-    if ttl > 0:
-        minutes, seconds = divmod(ttl, 60)
-        time_str = f"{minutes} دقیقه و {seconds} ثانیه" if minutes > 0 else f"{seconds} ثانیه"
-        await query.answer(f"⏳ لطفاً {time_str} دیگر صبر کنید.", show_alert=True)
-        return OTP
 
     await query.answer("در حال ارسال مجدد کد... ⏳")
     
@@ -887,7 +874,6 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")], [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_action")]])
         if response.status_code == 200:
-            await redis_client.setex(f"otp_cooldown:{phone}", 120, "1")
             await query.edit_message_text(f"✉️ <b>کد تایید مجدداً ارسال شد.</b>\nکد را وارد کنید:", reply_markup=kb, parse_mode='HTML')
         else:
             await query.edit_message_text(f"❌ <b>خطا در ارسال مجدد:</b>\n\n{format_server_response(response)}", reply_markup=kb, parse_mode='HTML')
@@ -1047,4 +1033,3 @@ async def main():
 if __name__ == '__main__':
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
-
